@@ -1,0 +1,4 @@
+# 编译产物（重新编译: /usr/local/cuda/bin/nvcc -O3 -std=c++17 -o gpu_stress gpu_stress.cu -lcublas）
+gpu_stress
+# 运行时生成的采样日志
+stress_gpu*.csv
