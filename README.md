@@ -20,18 +20,20 @@ cd /data/gpu_stress
 ## 运行
 
 ```bash
-./gpu_stress <GPU槽位> [矩阵边长N] [采样间隔秒]
+./gpu_stress <Physical Slot> [矩阵边长N] [采样间隔秒]
 ```
 
-- **GPU槽位** = `nvidia-smi` 的 GPU index（本机 `0` 或 `1`）。**该位置没有 GPU 时，打印提示并退出**（退出码 2）。
+- **Physical Slot** = `lspci -vv` 的 PCIe 物理槽位号（同 gpu_monitor.py 的 SLOT 列）。脚本启动时经 nvidia-smi BDF → lspci 自动映射到对应 GPU。**该位置没有 GPU 时，打印可用槽位列表并退出**（退出码 2）。
 - **N** = 矩阵边长，默认 4096（4096³ 单矩阵约 64MB，共约 192MB）。N 越大算力越高、占显存越多。
 - **采样间隔秒** = 温度/功耗曲线的时间粒度，默认 1 秒（最小 0.1 秒）。
+
+查本机可用槽位：`lspci -vv | grep -B1 "Physical Slot"`，或看 gpu_monitor 的 SLOT 列。
 
 示例：
 
 ```bash
-./gpu_stress 1              # 压测 GPU 1，默认 4096、1 秒采样
-./gpu_stress 0 8192 0.5     # 压测 GPU 0，更大矩阵、0.5 秒采样
+./gpu_stress 4              # 压测 slot 4 的 GPU，默认 4096、1 秒采样
+./gpu_stress 6 8192 0.5     # 压测 slot 6 的 GPU，更大矩阵、0.5 秒采样
 ```
 
 按 `Ctrl+C`（SIGINT/SIGTERM）停止，显存随即释放。

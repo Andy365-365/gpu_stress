@@ -7,8 +7,9 @@
 // 不受"跑完一批再采样"间隙的影响。
 //
 // 编译: nvcc -O3 -std=c++17 -o gpu_stress gpu_stress.cu -lcublas
-// 运行: ./gpu_stress <GPU槽位> [矩阵边长N] [采样间隔秒]
-//   槽位 = nvidia-smi 的 GPU index (0, 1, ...)；该位置无卡则打印提示并退出。
+// 运行: ./gpu_stress <Physical Slot> [矩阵边长N] [采样间隔秒]
+//   槽位 = lspci -vv 的 Physical Slot 号（同 gpu_monitor.py 的 SLOT 列）；
+//          该位置无卡则打印提示并退出。
 //   N    = 矩阵边长，默认 4096（越大占显存越多）
 //   间隔 = 采样间隔秒数，默认 1（温度曲线的时间粒度）
 
@@ -79,11 +80,13 @@ static void read_gpu(int slot, int* util, double* poww, int* mem, int* fan, int*
 }
 
 // 后台采样线程：固定间隔采样 nvidia-smi，更新共享指标并写 CSV
-static void sampler_thread(int slot, FILE* csv, long interval_ms) {
+// nvidia_index = nvidia-smi 的 GPU index（用于 -i 查询）
+// slot         = Physical Slot 号（用于 CSV 记录，用户视角）
+static void sampler_thread(int nvidia_index, int slot, FILE* csv, long interval_ms) {
     while (!g_stop.load()) {
         int util = -1, mem = -1, fan = -1, temp = -1;
         double poww = -1;
-        read_gpu(slot, &util, &poww, &mem, &fan, &temp);
+        read_gpu(nvidia_index, &util, &poww, &mem, &fan, &temp);
         m_util.store(util);
         m_temp.store(temp);
         m_fan.store(fan);
@@ -105,10 +108,11 @@ static void sampler_thread(int slot, FILE* csv, long interval_ms) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "用法: %s <GPU槽位> [矩阵边长N] [采样间隔秒]\n"
-            "  例:  %s 0\n"
-            "  例:  %s 1 4096 1\n"
-            "  槽位 = nvidia-smi 的 GPU index (0, 1, ...)；该位置无卡则打印提示并退出\n"
+            "用法: %s <Physical Slot> [矩阵边长N] [采样间隔秒]\n"
+            "  例:  %s 4\n"
+            "  例:  %s 6 4096 1\n"
+            "  槽位 = lspci -vv 的 Physical Slot 号（同 gpu_monitor.py 的 SLOT 列）\n"
+            "        该位置无卡则打印可用槽位列表并退出\n"
             "  N    = 矩阵边长，默认 4096（越大占显存越多）\n"
             "  间隔 = 采样间隔秒数，默认 1（温度曲线的时间粒度）\n",
             argv[0], argv[0], argv[0]);
@@ -126,20 +130,61 @@ int main(int argc, char** argv) {
 
     int devCount = 0;
     CHECK(cudaGetDeviceCount(&devCount));
-    if (slot < 0 || slot >= devCount) {
+
+    // 通过 nvidia-smi 拿每张卡的 BDF（与 gpu_monitor.py 同源），
+    // 再用 lspci -vv -s 解析 Physical Slot（lspci 的 "Physical Slot:" 行）
+    int nvidia_index = -1;
+    char avail_slots[128] = "";
+    FILE* qfp = popen("nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>/dev/null", "r");
+    if (qfp) {
+        char qline[256];
+        while (fgets(qline, sizeof(qline), qfp)) {
+            int idx;
+            char busid[32] = {0};
+            if (sscanf(qline, "%d,%31s", &idx, busid) != 2) continue;
+            // "00000000:84:00.0" → "84:00.0"（跳过 domain）
+            char* colon = strchr(busid, ':');
+            char bdf_short[16];
+            if (colon) snprintf(bdf_short, sizeof(bdf_short), "%s", colon + 1);
+            else snprintf(bdf_short, sizeof(bdf_short), "%s", busid);
+
+            char cmd[256], line[1024];
+            int phys_slot = -1;
+            snprintf(cmd, sizeof(cmd), "lspci -vv -s %s 2>/dev/null", bdf_short);
+            FILE* fp = popen(cmd, "r");
+            if (fp) {
+                while (fgets(line, sizeof(line), fp)) {
+                    char* ps = strstr(line, "Physical Slot:");
+                    if (ps) { phys_slot = atoi(ps + 14); break; }
+                }
+                fclose(fp);
+            }
+            if (phys_slot < 0) phys_slot = 0;   // 拿不到 Physical Slot 回退 0（同 gpu_monitor.py）
+
+            if (avail_slots[0]) strcat(avail_slots, ", ");
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", phys_slot);
+            strcat(avail_slots, buf);
+
+            if (phys_slot == slot) nvidia_index = idx;
+        }
+        fclose(qfp);
+    }
+
+    if (nvidia_index < 0) {
         fprintf(stderr,
-            "提示: GPU 槽位 %d 不存在。本机共有 %d 张 GPU（可用槽位 %d ~ %d）。退出。\n",
-            slot, devCount, 0, devCount - 1);
+            "提示: Physical Slot %d 不存在。本机可用槽位: %s。退出。\n",
+            slot, avail_slots);
         return 2;
     }
 
     cudaDeviceProp prop;
-    CHECK(cudaSetDevice(slot));
-    CHECK(cudaGetDeviceProperties(&prop, slot));
+    CHECK(cudaSetDevice(nvidia_index));
+    CHECK(cudaGetDeviceProperties(&prop, nvidia_index));
 
     double mb = (double)N * N * 4 / 1048576.0;   // 单矩阵 MiB
-    printf("压测目标 : GPU %d — %s（总显存 %.1f GB）\n", slot, prop.name,
-           prop.totalGlobalMem / 1073741824.0);
+    printf("压测目标 : Physical Slot %d (nvidia-smi GPU %d) — %s（总显存 %.1f GB）\n",
+           slot, nvidia_index, prop.name, prop.totalGlobalMem / 1073741824.0);
     printf("矩阵规模 : %d x %d x %d (FP32)，单矩阵 %.1f MiB\n", N, N, N, mb);
     printf("显存占用 : 约 %.0f MiB（3 块矩阵，停止后立即释放）\n", mb * 3);
     printf("采样间隔 : %ld ms（后台线程，独立于计算）\n", interval_ms);
@@ -186,7 +231,7 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     // 启动后台采样线程
-    std::thread sampler(sampler_thread, slot, csv, interval_ms);
+    std::thread sampler(sampler_thread, nvidia_index, slot, csv, interval_ms);
 
     // 主线程：持续 GEMM 不停机，定期同步测吞吐
     auto wall0 = std::chrono::steady_clock::now();
