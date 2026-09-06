@@ -25,8 +25,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-static std::atomic<bool> g_stop{false};
-static void on_sig(int s) { (void)s; g_stop = true; }
+static std::atomic<int> g_sig{0};   // 1 = 停止压测、进入冷却监控；>=2 = 退出程序
+static void on_sig(int s) { (void)s; g_sig.fetch_add(1); }
+static const int COOL_LIMIT_S = 30 * 60;   // 冷却监控默认时长：30 分钟（超时自动退出）
 
 // 两线程共享的最新指标（采样线程写，主线程读用于输出状态行）
 static std::atomic<int>      m_util{-1}, m_temp{-1}, m_fan{-1}, m_mem{-1};
@@ -101,8 +102,9 @@ static void read_gpu(int slot, int* util, double* poww, int* mem, int* fan, int*
 }
 
 // 后台采样线程：固定间隔采样 nvidia-smi，只更新共享指标（日志由主线程写）
+// 压测和冷却监控两个阶段都持续采样，直到收到第 2 次 Ctrl+C 或冷却监控超时
 static void sampler_thread(int nvidia_index, long interval_ms) {
-    while (!g_stop.load()) {
+    while (g_sig.load() < 2) {
         int util = -1, mem = -1, fan = -1, temp = -1, thr = -1;
         double poww = -1;
         read_gpu(nvidia_index, &util, &poww, &mem, &fan, &temp, &thr);
@@ -235,7 +237,7 @@ int main(int argc, char** argv) {
             snprintf(b, sizeof(b), "日志文件 : %s", logPath);
             log_out(b);
         }
-        log_out("开始压测… 按 Ctrl+C 停止");
+        log_out("开始压测… 按 Ctrl+C 停止（进入冷却监控，再按 Ctrl+C 退出）");
     }
 
     size_t bytes = (size_t)N * N * sizeof(float);
@@ -265,12 +267,13 @@ int main(int argc, char** argv) {
     std::thread sampler(sampler_thread, nvidia_index, interval_ms);
 
     // 主线程：持续 GEMM 不停机，定期同步测吞吐并输出状态行（终端 + 日志）
+    // 第 1 次 Ctrl+C（g_sig>=1）停止压测；第 2 次（g_sig>=2）直接跳到冷却结束
     auto wall0 = std::chrono::steady_clock::now();
     long totalIter = 0;
-    while (!g_stop) {
+    while (g_sig.load() < 1) {
         CHECK(cudaEventRecord(ev0));
         long count = 0;
-        for (long i = 0; i < 200 && !g_stop; i++) {
+        for (long i = 0; i < 200 && g_sig.load() < 1; i++) {
             CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                               N, N, N, &alpha, dA, N, dB, N, &beta, dC, N));
             count++;
@@ -294,15 +297,49 @@ int main(int argc, char** argv) {
         log_out(line);
     }
 
-    g_stop = true;
+    double el_stress = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+    double avg = (el_stress > 0) ? (2.0 * N * N * N * totalIter) / (el_stress * 1e12) : 0.0;
+    {
+        char b[256];
+        snprintf(b, sizeof(b), "压测停止。累计 %ld 次 GEMM，运行 %.0f 秒，平均 %.2f TFLOPS。",
+                 totalIter, el_stress, avg);
+        log_out(b);
+    }
+
+    // 冷却监控阶段：压测已停，采样线程继续，主线程按 1 秒节奏输出冷却曲线
+    // 结束条件：冷却满 30 分钟自动退出，或再按一次 Ctrl+C 提前退出
+    {
+        auto cool0 = std::chrono::steady_clock::now();
+        int coolSec = 0;
+        char b[512];
+        snprintf(b, sizeof(b), "进入冷却监控（最长 30 分钟自动退出，再按 Ctrl+C 立即退出）");
+        log_out(b);
+        while (g_sig.load() < 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            coolSec++;
+            if (coolSec >= COOL_LIMIT_S) break;
+            snprintf(b, sizeof(b),
+                     "  [冷却 %2d s] 温度 %3dC  风扇 %3d%%  利用率 %3d%%  功耗 %4.0f W  显存 %5d MiB  降频:%s",
+                     coolSec, m_temp.load(), m_fan.load(), m_util.load(),
+                     m_power_x100.load() / 100.0, m_mem.load(),
+                     m_throttle.load() == 1 ? "是" : (m_throttle.load() == 0 ? "否" : "?"));
+            log_out(b);
+        }
+        double el_cool = std::chrono::duration<double>(std::chrono::steady_clock::now() - cool0).count();
+        int reason = (g_sig.load() >= 2) ? 2 : 1;
+        snprintf(b, sizeof(b), "冷却监控结束（%s，%.0f 秒）。",
+                 reason == 1 ? "满 30 分钟自动退出" : "手动退出", el_cool);
+        log_out(b);
+    }
+
+    // 退出：停采样线程、释放显存、关日志
+    g_sig.store(2);
     sampler.join();
 
-    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
-    double avg = (el > 0) ? (2.0 * N * N * N * totalIter) / (el * 1e12) : 0.0;
     {
         char b[256];
         snprintf(b, sizeof(b), "已停止。累计 %ld 次 GEMM，运行 %.0f 秒，平均 %.2f TFLOPS。显存已释放。",
-                 totalIter, el, avg);
+                 totalIter, el_stress, avg);
         log_out(b);
     }
     if (g_log) {
