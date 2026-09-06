@@ -312,6 +312,7 @@ int main(int argc, char** argv) {
         auto cool0 = std::chrono::steady_clock::now();
         int coolSec = 0;
         char b[512];
+        log_out("=================================================================");
         snprintf(b, sizeof(b), "进入冷却监控（最长 30 分钟自动退出，再按 Ctrl+C 立即退出）");
         log_out(b);
         while (g_sig.load() < 2) {
