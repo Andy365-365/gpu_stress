@@ -40,22 +40,33 @@ cd /data/gpu_stress
 
 ## 输出
 
-**屏幕**（每 2 秒左右一行，主线程打印）：
+**屏幕**（主线程每 2 秒左右一行）：
 
 ```
-[GPU 1] 温度  89C  风扇 100%  利用率 100%  功耗  292 W  显存 22357 MiB  |  10.44 TFLOPS  |  3 s
+压测目标 : Physical Slot 4 (nvidia-smi GPU 1) — NVIDIA GeForce RTX 3090（总显存 23.6 GB）
+硬件标识 : UUID GPU-c128393b-548d-13e9-1fac-7b0824c410da
+矩阵规模 : 4096 x 4096 x 4096 (FP32)，单矩阵 64.0 MiB
+显存占用 : 约 192 MiB（3 块矩阵，停止后立即释放）
+采样间隔 : 1000 ms（后台线程，独立于计算）
+日志文件 : /data/gpu_stress/stress_gpu4_20260906_103656.log
+开始压测… 按 Ctrl+C 停止
+  [GPU 4] 温度  79C  风扇  96%  利用率 100%  功耗  299 W  显存 22345 MiB  降频:否  |   24.27 TFLOPS  |  2 s
 ```
 
-**CSV 日志**（后台线程每 N 秒一行，带时间戳，用于后期分析）：
+- **硬件标识** = 该卡的 GPU UUID（`nvidia-smi` 的唯一硬件标识），启动时打印一次，便于把日志对应到具体物理卡。
+- **降频** = 是否发生热降频，口径同 `/root/gpu_monitor.py`：`clocks_throttle_reasons.active & 0x60`（SW Thermal 0x20 | HW Thermal 0x40 任一激活即为"是"）；读不到显示 "?"。
+
+**日志文件**（内容 = 终端输出内容，每行前加时间戳，用于后期分析）：
 
 ```
-timestamp,slot,util_pct,temp_c,fan_pct,power_w,mem_mib,tflops
-2026-09-04 22:12:01,1,100,89,100,292,22357,10.44
-2026-09-04 22:12:02,1,100,89,100,291,22357,10.44
-...
+[2026-09-06 10:36:56] 压测目标 : Physical Slot 4 (nvidia-smi GPU 1) — NVIDIA GeForce RTX 3090（总显存 23.6 GB）
+[2026-09-06 10:36:56] 硬件标识 : UUID GPU-c128393b-548d-13e9-1fac-7b0824c410da
+[2026-09-06 10:36:57]   [GPU 4] 温度  78C  风扇  96%  利用率 100%  功耗  299 W  显存 22345 MiB  降频:否  |   24.38 TFLOPS  |  1 s
+[2026-09-06 10:36:58]   [GPU 4] 温度  79C  风扇  96%  利用率 100%  功耗  299 W  显存 22345 MiB  降频:否  |   24.27 TFLOPS  |  2 s
+[2026-09-06 10:37:00] 已停止。累计 600 次 GEMM，运行 4 秒，平均 19.64 TFLOPS。显存已释放。
 ```
 
-路径：`/data/gpu_stress/stress_gpu<槽位>_<日期>_<时间>.csv`，每行写完立即 flush（中途停止也保留已有数据）。可直接用 Excel / Pandas 导入，以 timestamp 为 x 轴、temp_c / power_w 为 y 轴画曲线。
+路径：`/data/gpu_stress/stress_gpu<槽位>_<日期>_<时间>.log`，每行写完立即 flush（中途停止也保留已有数据）。
 
 ## 设计要点：采样与计算解耦
 

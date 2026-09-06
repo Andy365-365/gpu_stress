@@ -2,3 +2,4 @@
 gpu_stress
 # 运行时生成的采样日志
 stress_gpu*.csv
+stress_gpu*.log
